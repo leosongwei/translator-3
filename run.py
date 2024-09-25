@@ -63,7 +63,7 @@ def main():
     model_utils.set_requires_grad(wrapped_model, False)
 
     gen_config = GenerationConfig(
-        max_length=200,
+        max_new_tokens=50,
         do_sample=True,
         top_p=0.95,
         no_repeat_ngram_size=2,
