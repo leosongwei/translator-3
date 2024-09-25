@@ -1,95 +1,89 @@
 import translation_utils
 import context_managers
 from ptuning_trainer import PtuningTrainer, PtuningConfigs
-import ptuning_model
-from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
 from transformers.generation import GenerationConfig
 import torch
-import statistics
 import json
 import tqdm
 import model_utils
 
 from wrappers.qwen2 import Qwen2Wrapper
 
+import argparse
 
-PTUNING = True
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("json_file_to_translate",
+                        help='json文件，为一个列表，每个元素至少包含一个"jp"键（可以设置），结果会写在"pred"键中，保存时将保存其它原始内容，方便你写脚本。',
+                        type=str)
+    parser.add_argument("--model_name", help="基础模型名称，可以指定你本地的Qwen/Qwen2.5-3B目录", type=str,
+                        default="Qwen/Qwen2.5-3B")
+    parser.add_argument("--lora_path", help="LoRA adaptor路径，跟目录下自带了一个我微调出来的", type=str,
+                        default="./lora_with_ptuning_epoch_7")
+    parser.add_argument("--out_file_name", help="输出文件", type=str,
+                        default="./translate_out.json")
+    parser.add_argument("--context_radius", help="上下文大小，比如为2则前面截2条后面截2条", type=int,
+                        default=2)
+    parser.add_argument("--input_key", help="目标内容的键名，默认为jp，你可以自己设置", type=str,
+                        default="jp")
+    parser.add_argument("--longest_seq", help="上下文大小，比如为2则前面截2条后面截2条", type=int,
+                        default=40)
+    args = parser.parse_args()
+    return args
 
+def main():
+    args = parse_args()
+    ptuning_configs = PtuningConfigs()
+    ptuning_trainer = PtuningTrainer()
+    torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 
-ptuning_configs = PtuningConfigs()
-#ptuning_configs.loss_limit = 3.5
-#ptuning_configs.context_max_epoch = 50
-ptuning_trainer = PtuningTrainer()
-torch.cuda.set_per_process_memory_fraction(0.9, device=0)
+    model_path = args.model_name
 
-model_path = "/home/leo/NLP/models/Qwen-VL/Qwen2.5-3B"
-wrapped_model, tokenizer = Qwen2Wrapper.from_model_dir(
-    model_path, ptuning_configs.pre_seq_len, PTUNING, ptuning_configs.device
-)
+    target_path = args.json_file_to_translate
+    with open(target_path, "r", encoding="utf8") as file:
+        content = json.load(file)
+    content = [{"jp": data[args.input_key][:args.longest_seq]} for data in content]
+    context = context_managers.Context([], content)
 
-target_path = "/home/leo/NLP/datasets/translate-jp-cn/datasets/subtitles/双语字幕/宫崎骏_诸神字幕组/字幕/output/天空之城 Laputa：Castle in the Sky (1986) BluRay 简日双语@诸神字幕组.jsonl"
-context = context_managers.Context([target_path])
-contents = context.get_contents() # [-200:]
+    wrapped_model, tokenizer = Qwen2Wrapper.from_model_dir(
+        model_path, ptuning_configs.pre_seq_len, True, ptuning_configs.device
+    )
+    original_model = wrapped_model.wrapper_original_model
 
-
-original_model = wrapped_model.wrapper_original_model
-if PTUNING:
-    # train embedding
+    # Train embedding
     wrapped_model.create_and_set_new_embedding()
-    context_with_embedding = ptuning_trainer.train_context(wrapped_model, tokenizer, ptuning_configs, context)
-    # load adapter
-    original_model.load_adapter("./lora_result/lora_with_ptuning_epoch_7")
+    model_utils.set_requires_grad(wrapped_model.wrapper_original_model, False)
+    ptuning_trainer.train_context(wrapped_model, tokenizer, ptuning_configs, context)
+    model_utils.set_requires_grad(wrapped_model.wrapper_original_model, True)
+
+    original_model.load_adapter(args.lora_path)
     wrapped_model.set_ptuning_status(True)
-    model_utils.set_requires_grad(wrapped_model.prefix_encoder.prefix_embedding, False)
-else:
-    original_model.load_adapter("./lora_out_without_ptuning")
-    wrapped_model.set_ptuning_status(False)
+    wrapped_model.current_model = original_model
+    model_utils.set_requires_grad(wrapped_model.prefix_encoder, False)
+    model_utils.set_requires_grad(wrapped_model, False)
 
-wrapped_model.current_model = original_model
-#print(wrapped_model.current_model)
+    gen_config = GenerationConfig(
+        max_length=200,
+        do_sample=True,
+        top_p=0.95,
+        no_repeat_ngram_size=2,
+        num_beams=8,
+        use_cache=True
+    )
 
+    # Load Target File
+    with open(args.json_file_to_translate, 'r', encoding="utf8") as file:
+        file_contents = json.load(file)
+    
+    target_key = args.input_key
 
-def compute_sentence_bleu(ground_truth: str, prediction: str):
-    # actual = list(jieba.cut(ground_truth))
-    # pred = list(jieba.cut(prediction))
-
-    actual = list(ground_truth)
-    pred = list(prediction)
-
-    result = sentence_bleu(
-                    [actual],
-                    pred,
-                    smoothing_function=SmoothingFunction().method3,
-                )
-    return result
-
-
-gen_config = GenerationConfig(
-    max_length=200,
-    do_sample=True,
-    top_p=0.95,
-    no_repeat_ngram_size=2,
-    # repetition_penalty=1.2,
-    # length_penalty=1.5,
-    num_beams=8,
-    use_cache=True
-)
-
-
-context_jp_cn_list = translation_utils.get_context_with_input_and_answer(contents, 2)
-
-
-results = []
-
-for i in range(1):
-    translate_results = []
-
-    total_score = 0.0
-    for context, jp, cn in tqdm.tqdm(context_jp_cn_list):
-        #prompt = translation_utils.make_prompt(tokenizer, pair['jp'])
+    for i, data in tqdm.tqdm(list(enumerate(file_contents))):
+        jp = data[target_key][:args.longest_seq]
+        start = max(0, i - args.context_radius)
+        end = min(len(file_contents), i + args.context_radius)
+        context = list(map(lambda x: x[target_key][:args.longest_seq], file_contents[start:end]))
         prompt = translation_utils.make_prompt_with_context(tokenizer, context, jp)
         model_inputs = translation_utils.make_proper_batch(tokenizer, [prompt], create_labels=False).to('cuda')
-        #model_inputs = wrapped_model.prepare_inputs_for_generation(**model_inputs)
         input_tokens_count = len(model_inputs["input_ids"][0])
 
         model_out = wrapped_model.generate(
@@ -100,65 +94,12 @@ for i in range(1):
         
         prediction_tokens = model_out[0][input_tokens_count:-1]
         prediction_string = tokenizer.decode(prediction_tokens)
+        data["pred"] = prediction_string
         
-        score = compute_sentence_bleu(cn, prediction_string)
-        print({"jp": jp, "cn": cn}, "pred:", prediction_string, "score:", score)
-        total_score += score
-
-        translate_results.append({"jp": jp, "cn": cn, "pred": prediction_string})
-
-    with open("translate_result.jsonl", "w", encoding="utf8") as file:
-        for line in translate_results:
-            json.dump(line, file, ensure_ascii=False)
-            print("", file=file)
-        
-    result = total_score / len(contents)
-    results.append(result)
-    print(f"avg score: {result:.3f}")
-print(f"test complete! scores: {results}, mean: {statistics.mean(results)}")
-
-# GLM3
-# NO PTUNING ~ 0.209
-# 0.208
-# 0.207
-# 0.214
-# 0.213
-# 0.206
-
-# WITH PTUNING ~ 0.218
-# 0.219
-# 0.226
-# 0.215
-# 0.216
-# 0.217
+    print("done!")
+    with open(args.out_file_name, "w", encoding="utf8") as file:
+        json.dump(file_contents, file, ensure_ascii=False, indent=2)
 
 
-# Qwen2
-
-# No Ptuning 0.227
-# scores: [0.22955582577081107, 0.22905574217120678, 0.2319524777928255, 0.22200349184881993, 0.2241340125953616]
-# , mean: 0.22734031003580496
-
-# Ptuning:
-# test complete! scores: [0.2154786973102854, 0.2105084849234588, 0.22284781627240555, 0.2293982529580425, 0.21524629049165916],
-# mean: 0.21869590839117029
-
-# Context
-# --------------------------------------
-#avg score: 0.238
-# without ptuning
-#test complete! scores: [0.2455124181679597, 0.25666824675898764, 0.24010735971118727, 0.25084386565313727, 0.23845139383396086],
-# mean: 0.24631665682504655
-
-
-# ptuning-loss-3.0
-# test complete! scores: [0.20830857240376083, 0.2083954551115074, 0.20874045248834194, 0.1956899183191136, 0.21098421549277765],
-# mean: 0.20642372276310028
-
-# ptuning-loss-2.5
-# test complete! scores: [0.21894797985751135, 0.21774796504543434, 0.2189628479177296, 0.21158281752753683, 0.2146601374662604]
-# , mean: 0.2163803495628945
-
-# ptuning-loss-2.0
-# test complete! scores: [0.19707280026539883, 0.19521469654756796, 0.1967848166690209, 0.20286797057553627, 0.213098905752612],
-# mean: 0.2010078379620272
+if __name__ == "__main__":
+    main()

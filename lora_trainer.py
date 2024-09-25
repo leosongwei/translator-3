@@ -1,6 +1,5 @@
 from peft import LoraConfig, get_peft_model
 import context_managers
-import ptuning_model
 import translation_utils
 import json
 import safetensors.torch

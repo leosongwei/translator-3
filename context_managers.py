@@ -9,7 +9,7 @@ import ptuning_utils
 
 
 class Context:
-    def __init__(self, filenames: List[str]) -> None:
+    def __init__(self, filenames: List[str], content: None) -> None:
         """
         I expect your RAM should hold everything, since we are doing fine tuning.
         For ptuning training. 
@@ -17,7 +17,7 @@ class Context:
         """
 
         self._filenames = filenames
-        self._content = []
+        self._content = content if content else []
         for filename in self._filenames:
             with open(filename, 'r', encoding='utf8') as file:
                 pairs = list(map(json.loads, file.readlines()))

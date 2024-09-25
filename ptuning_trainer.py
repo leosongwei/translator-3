@@ -24,14 +24,12 @@ class PtuningConfigs:
 
 
 class PtuningTrainer:
-    def __init__(self) -> None:
-        self.context_manager = context_managers.ContextManager()
-
+    
     def train_context(self, model: Qwen2Wrapper, tokenizer, config, context: context_managers.Context):
         assert isinstance(model, Qwen2Wrapper)
         new_embedding = model.create_and_set_new_embedding()
         params_to_train = new_embedding.parameters()
-        optimizer = bitsandbytes.optim.AdamW8bit(params=params_to_train, lr=config.lr)
+        optimizer = bitsandbytes.optim.AdamW8bit(params=params_to_train, lr=config.lr, optim_bits=8)
         
         batches = context.get_batches_for_ptuning(
             "jp", config.batch_size, tokenizer, config.qlen_demanded
@@ -69,6 +67,8 @@ class PtuningTrainer:
         return context_with_embedding, loss_avg
 
     def train_all(self, model_dir: str, config: PtuningConfigs):
+        self.context_manager = context_managers.ContextManager()
+
         wrapper_model, tokenizer = Qwen2Wrapper.from_model_dir(model_dir, config.pre_seq_len, True, config.device)
         model_utils.set_requires_grad(wrapper_model.wrapper_original_model, False)
         
